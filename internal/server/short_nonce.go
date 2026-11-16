@@ -19,12 +19,11 @@ type NonceManager interface {
 }
 
 const (
-	shortNonceLifetime     = time.Hour // Same as original
-	shortNonceKeyLength    = 64        // Same as original
-	shortNonceTimestampLen = 4         // 6 bytes for timestamp (minutes) - optimal size
-	shortNonceMinHMACLen   = 2         // Minimum HMAC length for security
-	shortNonceMaxHMACLen   = 32        // Maximum HMAC length (full SHA256)
-	defaultNonceHMACLen    = 12        // Default HMAC length
+	shortNonceKeyLength    = 64 // Same as original
+	shortNonceTimestampLen = 4  // 6 bytes for timestamp (minutes) - optimal size
+	shortNonceMinHMACLen   = 2  // Minimum HMAC length for security
+	shortNonceMaxHMACLen   = 32 // Maximum HMAC length (full SHA256)
+	defaultNonceHMACLen    = 12 // Default HMAC length
 )
 
 // NewShortNonceHash creates a ShortNonceHash. The hmacLen argument specifies the number of HMAC
@@ -59,8 +58,11 @@ type ShortNonceHash struct {
 
 // Generate a short nonce (4 + hmacLen bytes encoded as base36).
 func (s *ShortNonceHash) Generate() (string, error) {
-	timestampMinutes := time.Now().Unix() / 60
+	return s.generateAt(time.Now())
+}
 
+func (s *ShortNonceHash) generateAt(now time.Time) (string, error) {
+	timestampMinutes := now.Unix() / 60
 	// Convert to bytes and trim to 4 bytes.  This safely handles the conversion since we know
 	// current values fit in 4 bytes until year 10,135.
 	timestampBytes8 := make([]byte, 8)
@@ -82,7 +84,8 @@ func (s *ShortNonceHash) Generate() (string, error) {
 	return encodeBase36(nonce), nil
 }
 
-// Validate checks that nonce is signed and is not expired.
+// Validate checks that nonce is signed, is not from the future beyond the
+// allowed clock skew and is not expired.
 func (s *ShortNonceHash) Validate(nonce string) error {
 	nonceBytes := decodeBase36(nonce)
 	if nonceBytes == nil {
@@ -105,14 +108,14 @@ func (s *ShortNonceHash) Validate(nonce string) error {
 	receivedHMAC := nonceBytes[shortNonceTimestampLen:]
 	timestampMinutes := int64(binary.BigEndian.Uint32(timestampBytes))
 
-	// Check if nonce is expired (older than 1 hour).
-	currentMinutes := time.Now().Unix() / 60
-	if currentMinutes < timestampMinutes {
+	// Apply the same future skew and maximum lifetime rules as the long nonce.
+	ts := time.Unix(timestampMinutes*60, 0)
+
+	if time.Until(ts) > nonceClockSkew {
 		return errInvalidNonce
 	}
 
-	ageMinutes := currentMinutes - timestampMinutes
-	if ageMinutes > 60 {
+	if time.Since(ts) > nonceLifetime {
 		return errInvalidNonce
 	}
 
