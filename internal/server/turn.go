@@ -374,7 +374,10 @@ func handleCreatePermissionRequest(req Request, stunMsg *stun.Message) error {
 		return fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr())
 	}
 
-	addCount := 0
+	// Phase 1: parse and validate every XOR-PEER-ADDRESS before touching the
+	// allocation. The transaction is all-or-nothing so that a later peer being
+	// rejected cannot leave permissions installed for earlier peers.
+	peerAddresses := make([]proto.PeerAddress, 0)
 	errorCode := stun.CodeBadRequest
 
 	if err := stunMsg.ForEach(stun.AttrXORPeerAddress, func(m *stun.Message) error {
@@ -400,10 +403,37 @@ func handleCreatePermissionRequest(req Request, stunMsg *stun.Message) error {
 			return err
 		}
 
+		peerAddresses = append(peerAddresses, peerAddress)
+
+		return nil
+	}); err != nil {
+		// No permission has been installed: reply with the error and leave the
+		// allocation untouched.
+		return buildAndSend(
+			req.Conn,
+			req.SrcAddr,
+			buildMsg(stunMsg.TransactionID, stun.NewType(stun.MethodCreatePermission, stun.ClassErrorResponse),
+				&stun.ErrorCodeAttribute{Code: errorCode}, messageIntegrity)...,
+		)
+	}
+
+	if len(peerAddresses) == 0 {
+		return buildAndSend(
+			req.Conn,
+			req.SrcAddr,
+			buildMsg(stunMsg.TransactionID, stun.NewType(stun.MethodCreatePermission, stun.ClassErrorResponse),
+				&stun.ErrorCodeAttribute{Code: stun.CodeBadRequest}, messageIntegrity)...,
+		)
+	}
+
+	// Phase 2: all peers passed validation. Build and commit the permissions in a
+	// single atomic operation on the authenticated allocation.
+	newPermissions := make([]*allocation.Permission, 0, len(peerAddresses))
+	for _, peerAddress := range peerAddresses {
 		req.Log.Debugf("Adding permission for %s", net.JoinHostPort(
 			peerAddress.IP.String(), strconv.Itoa(peerAddress.Port)))
 
-		alloc.AddPermission(allocation.NewPermission(
+		newPermissions = append(newPermissions, allocation.NewPermission(
 			&net.UDPAddr{
 				IP:   peerAddress.IP,
 				Port: peerAddress.Port,
@@ -411,30 +441,14 @@ func handleCreatePermissionRequest(req Request, stunMsg *stun.Message) error {
 			req.Log,
 			req.PermissionTimeout,
 		))
-		addCount++
-
-		return nil
-	}); err != nil {
-		addCount = 0
 	}
-
-	respClass := stun.ClassSuccessResponse
-	if addCount == 0 {
-		respClass = stun.ClassErrorResponse
-	}
-	attrs := []stun.Setter{messageIntegrity}
-	if respClass == stun.ClassErrorResponse {
-		attrs = []stun.Setter{
-			&stun.ErrorCodeAttribute{Code: errorCode},
-			messageIntegrity,
-		}
-	}
+	alloc.AddPermissions(newPermissions)
 
 	return buildAndSend(
 		req.Conn,
 		req.SrcAddr,
-		buildMsg(stunMsg.TransactionID, stun.NewType(stun.MethodCreatePermission, respClass),
-			attrs...)...,
+		buildMsg(stunMsg.TransactionID, stun.NewType(stun.MethodCreatePermission, stun.ClassSuccessResponse),
+			messageIntegrity)...,
 	)
 }
 

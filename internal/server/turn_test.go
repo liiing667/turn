@@ -885,6 +885,204 @@ func TestHandleCreatePermissionRequest(t *testing.T) { //nolint:dupl
 	})
 }
 
+func newCreatePermissionRequest(t *testing.T, key string, peers ...*proto.PeerAddress) *stun.Message {
+	t.Helper()
+
+	m := &stun.Message{}
+	m.TransactionID = stun.NewTransactionID()
+	assert.NoError(t, m.Build(stun.NewType(stun.MethodCreatePermission, stun.ClassRequest)))
+	assert.NoError(t, (stun.MessageIntegrity(key)).AddTo(m))
+	assert.NoError(t, (stun.Nonce(key)).AddTo(m))
+	assert.NoError(t, (stun.Realm(key)).AddTo(m))
+	assert.NoError(t, (stun.Username(testUser)).AddTo(m))
+	for _, peer := range peers {
+		assert.NoError(t, peer.AddTo(m))
+	}
+
+	return m
+}
+
+// TestCreatePermissionTransactionIsAtomic verifies that a CreatePermission request
+// containing multiple XOR-PEER-ADDRESS attributes is all-or-nothing: when an earlier
+// peer is allowed but a later peer is rejected, none of the permissions may remain
+// installed on the allocation.
+func TestCreatePermissionTransactionIsAtomic(t *testing.T) {
+	logger := logging.NewDefaultLoggerFactory().NewLogger("turn")
+
+	allowedPeer := net.ParseIP("192.0.2.10")
+	deniedPeer := net.ParseIP("198.51.100.20")
+
+	var eventMu sync.Mutex
+	createdEventPeers := []net.IP{}
+
+	allocationManager, err := allocation.NewManager(allocation.ManagerConfig{
+		AllocatePacketConn: func(conf allocation.AllocateListenerConfig) (net.PacketConn, net.Addr, error) {
+			con, listenErr := net.ListenPacket(conf.Network, "0.0.0.0:0") // nolint: noctx
+			if listenErr != nil {
+				return nil, nil, listenErr
+			}
+
+			return con, con.LocalAddr(), nil
+		},
+		AllocateListener: func(allocation.AllocateListenerConfig) (net.Listener, net.Addr, error) {
+			return nil, nil, nil
+		},
+		AllocateConn: func(allocation.AllocateConnConfig) (net.Conn, error) {
+			return nil, nil //nolint:nilnil
+		},
+		PermissionHandler: func(_ net.Addr, peerIP net.IP) bool {
+			return !peerIP.Equal(deniedPeer)
+		},
+		EventHandler: allocation.EventHandler{
+			OnPermissionCreated: func(_, _ net.Addr, _, userID, _ string, _ net.Addr, peer net.IP) {
+				assert.Equal(t, testUser, userID, "permission event must be attributed to the authenticated user")
+				eventMu.Lock()
+				defer eventMu.Unlock()
+				createdEventPeers = append(createdEventPeers, peer)
+			},
+		},
+		LeveledLogger: logger,
+	})
+	assert.NoError(t, err)
+	defer allocationManager.Close() //nolint:errcheck
+
+	nonceHash, err := NewShortNonceHash(0)
+	assert.NoError(t, err)
+	staticKey, err := nonceHash.Generate()
+	assert.NoError(t, err)
+
+	conn := newCapturePacketConn(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 3478})
+	defer conn.Close() //nolint:errcheck
+
+	req := Request{
+		AllocationManager: allocationManager,
+		NonceHash:         nonceHash,
+		Conn:              conn,
+		SrcAddr:           &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5000},
+		Log:               logger,
+		AuthHandler: func(*auth.RequestAttributes) (string, []byte, bool) {
+			return testUser, []byte(staticKey), true
+		},
+		PermissionTimeout: 5 * time.Minute,
+	}
+
+	fiveTuple := &allocation.FiveTuple{
+		SrcAddr:  req.SrcAddr,
+		DstAddr:  req.Conn.LocalAddr(),
+		Protocol: allocation.UDP,
+	}
+	alloc, err := req.AllocationManager.CreateAllocation(fiveTuple, req.Conn, proto.ProtoUDP,
+		0, time.Hour, testUser, "", proto.RequestedFamilyIPv4)
+	assert.NoError(t, err)
+
+	peerAddr := func(ip net.IP) *net.UDPAddr {
+		return &net.UDPAddr{IP: ip, Port: 8080}
+	}
+
+	t.Run("DeniedLaterPeerLeavesNoPermission", func(t *testing.T) {
+		conn.Reset()
+		m := newCreatePermissionRequest(t, staticKey,
+			&proto.PeerAddress{IP: allowedPeer, Port: 8080},
+			&proto.PeerAddress{IP: deniedPeer, Port: 8080},
+		)
+
+		assert.NoError(t, handleCreatePermissionRequest(req, m))
+
+		raw := conn.LastWrite()
+		assert.NotEmpty(t, raw)
+		res := &stun.Message{Raw: append([]byte(nil), raw...)}
+		assert.NoError(t, res.Decode())
+		assert.Equal(t, stun.MethodCreatePermission, res.Type.Method)
+		assert.Equal(t, stun.ClassErrorResponse, res.Type.Class)
+		var code stun.ErrorCodeAttribute
+		assert.NoError(t, code.GetFrom(res))
+		assert.Equal(t, stun.CodeForbidden, code.Code)
+
+		assert.Nil(t, alloc.GetPermission(peerAddr(allowedPeer)),
+			"allowed peer permission must be rolled back when a later peer is denied")
+		assert.Nil(t, alloc.GetPermission(peerAddr(deniedPeer)))
+		assert.Empty(t, alloc.ListPermissions())
+
+		eventMu.Lock()
+		assert.Empty(t, createdEventPeers, "a failed transaction must not emit permission-created events")
+		eventMu.Unlock()
+	})
+
+	t.Run("FamilyMismatchLeavesNoPermission", func(t *testing.T) {
+		conn.Reset()
+		m := newCreatePermissionRequest(t, staticKey,
+			&proto.PeerAddress{IP: allowedPeer, Port: 8080},
+			&proto.PeerAddress{IP: net.ParseIP("2001:db8::1"), Port: 8080},
+		)
+
+		assert.NoError(t, handleCreatePermissionRequest(req, m))
+
+		raw := conn.LastWrite()
+		assert.NotEmpty(t, raw)
+		res := &stun.Message{Raw: append([]byte(nil), raw...)}
+		assert.NoError(t, res.Decode())
+		assert.Equal(t, stun.ClassErrorResponse, res.Type.Class)
+		var code stun.ErrorCodeAttribute
+		assert.NoError(t, code.GetFrom(res))
+		assert.Equal(t, stun.CodePeerAddrFamilyMismatch, code.Code)
+
+		assert.Nil(t, alloc.GetPermission(peerAddr(allowedPeer)),
+			"allowed peer permission must be rolled back on address family mismatch")
+		assert.Empty(t, alloc.ListPermissions())
+
+		eventMu.Lock()
+		assert.Empty(t, createdEventPeers, "a failed transaction must not emit permission-created events")
+		eventMu.Unlock()
+	})
+
+	t.Run("AllPeersAcceptedInstallsAllPermissions", func(t *testing.T) {
+		conn.Reset()
+		otherPeer := net.ParseIP("192.0.2.11")
+		m := newCreatePermissionRequest(t, staticKey,
+			&proto.PeerAddress{IP: allowedPeer, Port: 8080},
+			&proto.PeerAddress{IP: otherPeer, Port: 8081},
+		)
+
+		assert.NoError(t, handleCreatePermissionRequest(req, m))
+
+		raw := conn.LastWrite()
+		assert.NotEmpty(t, raw)
+		res := &stun.Message{Raw: append([]byte(nil), raw...)}
+		assert.NoError(t, res.Decode())
+		assert.Equal(t, stun.ClassSuccessResponse, res.Type.Class)
+
+		assert.NotNil(t, alloc.GetPermission(peerAddr(allowedPeer)))
+		assert.NotNil(t, alloc.GetPermission(&net.UDPAddr{IP: otherPeer, Port: 8081}))
+
+		eventMu.Lock()
+		createdEventStrings := make([]string, len(createdEventPeers))
+		for i, peer := range createdEventPeers {
+			createdEventStrings[i] = peer.String()
+		}
+		assert.ElementsMatch(t, []string{allowedPeer.String(), otherPeer.String()}, createdEventStrings,
+			"each committed permission must be attributed per peer IP")
+		eventMu.Unlock()
+
+		// A subsequent failed transaction must not remove permissions committed by
+		// an earlier successful request.
+		conn.Reset()
+		failing := newCreatePermissionRequest(t, staticKey,
+			&proto.PeerAddress{IP: net.ParseIP("192.0.2.12"), Port: 8080},
+			&proto.PeerAddress{IP: deniedPeer, Port: 8080},
+		)
+		assert.NoError(t, handleCreatePermissionRequest(req, failing))
+
+		assert.NotNil(t, alloc.GetPermission(peerAddr(allowedPeer)),
+			"a failed new transaction must not roll back previously committed permissions")
+		assert.Nil(t, alloc.GetPermission(&net.UDPAddr{IP: net.ParseIP("192.0.2.12"), Port: 8080}))
+
+		eventMu.Lock()
+		assert.Len(t, createdEventPeers, 2,
+			"the failed follow-up transaction must not emit permission-created events")
+		eventMu.Unlock()
+	})
+}
+
 func TestHandleSendIndication(t *testing.T) {
 	conn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
 	assert.NoError(t, err)

@@ -95,6 +95,48 @@ func TestAddPermission(t *testing.T) {
 	assert.Equal(t, p, foundPermission)
 }
 
+func TestAddPermissionsAtomicAndEvents(t *testing.T) {
+	var createdMu sync.Mutex
+	createdPeers := []net.IP{}
+	alloc := NewAllocation(nil, &FiveTuple{}, EventHandler{
+		OnPermissionCreated: func(_, _ net.Addr, _, _, _ string, _ net.Addr, peer net.IP) {
+			createdMu.Lock()
+			defer createdMu.Unlock()
+			createdPeers = append(createdPeers, peer)
+		},
+	}, nil)
+
+	peerA := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 8080}
+	peerB := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 11), Port: 8081}
+
+	alloc.AddPermissions([]*Permission{
+		NewPermission(peerA, nil, DefaultPermissionTimeout),
+		NewPermission(peerB, nil, DefaultPermissionTimeout),
+	})
+
+	assert.NotNil(t, alloc.GetPermission(peerA))
+	assert.NotNil(t, alloc.GetPermission(peerB))
+
+	createdMu.Lock()
+	assert.ElementsMatch(t, []net.IP{peerA.IP, peerB.IP}, createdPeers)
+	createdMu.Unlock()
+
+	// Re-submitting an existing peer refreshes it without a duplicate created event,
+	// and a duplicate entry inside one batch still results in a single permission.
+	alloc.AddPermissions([]*Permission{
+		NewPermission(peerA, nil, DefaultPermissionTimeout),
+		NewPermission(&net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 8080}, nil, DefaultPermissionTimeout),
+	})
+
+	createdMu.Lock()
+	assert.Len(t, createdPeers, 2, "refreshing an existing permission must not emit a created event")
+	createdMu.Unlock()
+
+	// Empty batch is a no-op and leaves the committed permissions untouched.
+	alloc.AddPermissions(nil)
+	assert.Len(t, alloc.ListPermissions(), 2)
+}
+
 func TestAddPermissionPublishesInitializedTimer(t *testing.T) {
 	callbackStarted := make(chan struct{})
 	releaseCallback := make(chan struct{})

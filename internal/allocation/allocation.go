@@ -93,21 +93,57 @@ func (a *Allocation) AddPermission(perms *Permission) {
 	fingerprint := ipnet.FingerprintAddr(perms.Addr)
 
 	a.permissionsLock.Lock()
-	existedPermission, ok := a.permissions[fingerprint]
-	if ok {
-		existedPermission.refresh(perms.timeout)
-		a.permissionsLock.Unlock()
+	newPermissions := a.addPermissionsLocked(map[string]*Permission{fingerprint: perms})
+	a.permissionsLock.Unlock()
 
+	a.emitPermissionsCreated(newPermissions)
+}
+
+// AddPermissions atomically adds or refreshes the given permissions. All permissions are
+// committed together: callers must validate every peer (address family and authorization
+// policy) before calling this method, so a failed CreatePermission transaction cannot leave
+// partially installed permissions on the allocation.
+func (a *Allocation) AddPermissions(perms []*Permission) {
+	pending := make(map[string]*Permission, len(perms))
+	for _, perm := range perms {
+		pending[ipnet.FingerprintAddr(perm.Addr)] = perm
+	}
+
+	a.permissionsLock.Lock()
+	newPermissions := a.addPermissionsLocked(pending)
+	a.permissionsLock.Unlock()
+
+	a.emitPermissionsCreated(newPermissions)
+}
+
+// addPermissionsLocked installs the pending permissions, refreshing any permission that
+// already exists. Only newly created permissions are returned for event reporting.
+// The caller must hold a.permissionsLock.
+func (a *Allocation) addPermissionsLocked(pending map[string]*Permission) []*Permission {
+	newPermissions := make([]*Permission, 0, len(pending))
+	for fingerprint, perm := range pending {
+		if existedPermission, ok := a.permissions[fingerprint]; ok {
+			existedPermission.refresh(perm.timeout)
+
+			continue
+		}
+
+		perm.allocation = a
+		perm.start(perm.timeout)
+		a.permissions[fingerprint] = perm
+		newPermissions = append(newPermissions, perm)
+	}
+
+	return newPermissions
+}
+
+func (a *Allocation) emitPermissionsCreated(perms []*Permission) {
+	if a.eventHandler.OnPermissionCreated == nil {
 		return
 	}
 
-	perms.allocation = a
-	perms.start(perms.timeout)
-	a.permissions[fingerprint] = perms
-	a.permissionsLock.Unlock()
-
-	if a.eventHandler.OnPermissionCreated != nil {
-		if u, ok := perms.Addr.(*net.UDPAddr); ok {
+	for _, perm := range perms {
+		if u, ok := perm.Addr.(*net.UDPAddr); ok {
 			a.eventHandler.OnPermissionCreated(a.fiveTuple.SrcAddr, a.fiveTuple.DstAddr,
 				a.fiveTuple.Protocol.String(), a.userID, a.realm,
 				a.RelayAddr, u.IP)
