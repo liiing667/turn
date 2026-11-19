@@ -167,7 +167,15 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 	if err = requestedFamily.GetFrom(stunMsg); err != nil {
 		switch {
 		case errors.Is(err, stun.ErrAttributeNotFound):
-			requestedFamily = defaultAllocationAddressFamily(req)
+			requestedFamily, err = defaultAllocationAddressFamily(req)
+			if err != nil {
+				msg := buildMsg(
+					stunMsg.TransactionID,
+					stun.NewType(stun.MethodAllocate, stun.ClassErrorResponse),
+					&stun.ErrorCodeAttribute{Code: stun.CodeAddrFamilyNotSupported}, messageIntegrity)
+
+				return buildAndSendErr(req.Conn, req.SrcAddr, err, msg...)
+			}
 		case stun.IsAttrSizeInvalid(err) || stun.IsAttrSizeOverflow(err):
 			return buildAndSendErr(req.Conn, req.SrcAddr, err, badRequestMsg...)
 		default:
@@ -602,6 +610,20 @@ func handleChannelData(req Request, channelData *proto.ChannelData) error {
 		return fmt.Errorf("%w %x", errNoSuchChannelBind, uint16(channelData.Number))
 	}
 
+	// RFC 6156: every peer reachable through an allocation must belong to the
+	// allocation's address family. ChannelBind enforces this at binding time,
+	// but stale or manually installed bindings are re-validated here so a
+	// ChannelData packet can never relay cross-family traffic.
+	peerIP, _, err := ipnet.AddrIPPort(channel.Peer)
+	if err != nil {
+		return fmt.Errorf("%w: %s", errPeerAddressFamilyMismatch, err.Error())
+	}
+	if !ipMatchesFamily(peerIP, alloc.AddressFamily()) {
+		req.Log.Debugf("peer address family mismatch for client %s to peer %s", req.SrcAddr, channel.Peer)
+
+		return errPeerAddressFamilyMismatch
+	}
+
 	l, err := alloc.WriteTo(channelData.Data, channel.Peer)
 	if err != nil {
 		return fmt.Errorf("%w: %s", errFailedWriteSocket, err.Error())
@@ -638,6 +660,23 @@ func handleConnectRequest(req Request, stunMsg *stun.Message) error {
 			stunMsg.TransactionID,
 			stun.NewType(stun.MethodConnect, stun.ClassErrorResponse),
 			&stun.ErrorCodeAttribute{Code: stun.CodeBadRequest}, messageIntegrity)...)
+	}
+
+	// RFC 6156: The peer address family must match the allocation's relayed
+	// address family. Without this check an attacker could use an RFC 6062
+	// Connect request to open an outbound connection through a relay whose
+	// scope is constrained to another family (e.g. an IPv6 peer on an IPv4
+	// allocation), bypassing the family-based relay policy. The check runs
+	// before the permission handler so no cross-family peer is ever evaluated
+	// or dialed.
+	if !ipMatchesFamily(peerAddr.IP, alloc.AddressFamily()) {
+		req.Log.Infof("peer address family mismatch for client %s to peer %s", req.SrcAddr, peerAddr.IP)
+
+		peerAddrFamilyMismatchMsg := buildMsg(stunMsg.TransactionID,
+			stun.NewType(stun.MethodConnect, stun.ClassErrorResponse),
+			&stun.ErrorCodeAttribute{Code: stun.CodePeerAddrFamilyMismatch}, messageIntegrity)
+
+		return buildAndSendErr(req.Conn, req.SrcAddr, errPeerAddressFamilyMismatch, peerAddrFamilyMismatchMsg...)
 	}
 
 	if err = req.AllocationManager.GrantPermission(req.SrcAddr, peerAddr.IP); err != nil {
@@ -774,29 +813,31 @@ func ipMatchesFamily(ip net.IP, family proto.RequestedAddressFamily) bool {
 	return false
 }
 
-func defaultAllocationAddressFamily(req Request) proto.RequestedAddressFamily {
+func defaultAllocationAddressFamily(req Request) (proto.RequestedAddressFamily, error) {
 	if req.StrictAddressFamily {
-		return proto.RequestedFamilyIPv4
+		return proto.RequestedFamilyIPv4, nil
 	}
 
 	ip, _, err := ipnet.AddrIPPort(req.Conn.LocalAddr())
 	if err != nil {
-		return proto.RequestedFamilyIPv4
+		return 0, fmt.Errorf("%w: cannot classify listener address: %s", errUnsupportedAddressFamily, err.Error())
 	}
 
 	// some dual-stack wildcard sockets can report [::] as LocalAddr even for IPv4 or
 	// ipv6-mapped IPv4 addresses.
 	if ip.IsUnspecified() {
 		if family, ok := addressFamilyFromAddr(req.SrcAddr); ok {
-			return family
+			return family, nil
 		}
+
+		return 0, fmt.Errorf("%w: cannot classify client address %s", errUnsupportedAddressFamily, req.SrcAddr)
 	}
 
 	if family, ok := addressFamilyFromIP(ip); ok {
-		return family
+		return family, nil
 	}
 
-	return proto.RequestedFamilyIPv4
+	return 0, fmt.Errorf("%w: cannot classify listener address %s", errUnsupportedAddressFamily, ip)
 }
 
 func addressFamilyFromAddr(addr net.Addr) (proto.RequestedAddressFamily, bool) {
